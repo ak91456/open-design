@@ -415,7 +415,8 @@ open-design/
 │       └── browser-chrome.html
 │
 ├── templates/
-│   └── deck-framework.html        ← deck baseline (nav / counter / print)
+│   ├── deck-framework.html        ← deck baseline (nav / counter / print)
+│   └── kami-deck.html             ← kami-flavored deck starter (parchment / ink-blue serif)
 │
 ├── scripts/
 │   └── sync-design-systems.ts     ← re-import upstream awesome-design-md tarball

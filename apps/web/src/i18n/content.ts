@@ -181,6 +181,8 @@ const DE_DESIGN_SYSTEM_SUMMARIES: Record<string, string> = {
   hashicorp: 'Infrastrukturautomatisierung. Sauberer Enterprise-Look, Schwarz und Weiß.',
   ibm: 'Enterprise-Technologie. Carbon Design System, strukturierte blaue Palette.',
   intercom: 'Customer Messaging. Freundliche blaue Palette, konversationelle UI-Muster.',
+  kami:
+    'Editoriales Papiersystem. Warme Pergament-Leinwand, tintenblauer Akzent, Serif in nur einem Schnitt — gemacht für Lebensläufe, One-Pager, White-Paper, Portfolios und Slide-Decks.',
   kraken: 'Krypto-Trading. Dunkle UI mit violettem Akzent, datenreiche Dashboards.',
   lamborghini: 'Supercar-Marke. Echtschwarze Flächen, Goldakzente, dramatische Großbuchstaben-Typografie.',
   'linear-app': 'Projektmanagement. Ultraminimal, präzise, violetter Akzent.',
@@ -253,6 +255,7 @@ const DE_DESIGN_SYSTEM_CATEGORIES: Record<string, string> = {
   'E-Commerce & Retail': 'E-Commerce & Handel',
   'Media & Consumer': 'Medien & Consumer',
   Automotive: 'Automotive',
+  'Editorial & Print': 'Editorial & Print',
   'Retro & Nostalgic': 'Retro & Nostalgisch',
   'Themed & Unique': 'Thematisch & Einzigartig',
   Uncategorized: 'Nicht kategorisiert',
