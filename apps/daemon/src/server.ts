@@ -4420,7 +4420,7 @@ export async function startServer({
     try {
       const relPath = req.params[0];
       const project = getProject(db, req.params.id);
-      const file = await readProjectFile(PROJECTS_DIR, req.params.id, relPath, project?.metadata);
+
       // PreviewModal loads artifact HTML via srcdoc, giving the iframe Origin: "null".
       // data: URIs, file://, and some sandboxed iframes also send null — all are
       // local-only callers, so this is safe. Real cross-origin sites send a real
@@ -4428,6 +4428,62 @@ export async function startServer({
       if (req.headers.origin === 'null') {
         res.header('Access-Control-Allow-Origin', '*');
       }
+
+      // Stat the file first without buffering so we can choose the right path.
+      const meta = await resolveProjectFilePath(
+        PROJECTS_DIR,
+        req.params.id,
+        relPath,
+        project?.metadata,
+      );
+
+      // Stream video/audio with HTTP 206 Partial Content support (RFC 7233).
+      // The inline VideoViewer and AudioViewer components fetch this route;
+      // browsers require Accept-Ranges + 206 responses to play and seek media.
+      if (meta.mime.startsWith('video/') || meta.mime.startsWith('audio/')) {
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', meta.mime);
+
+        if (meta.size === 0) {
+          res.setHeader('Content-Length', '0');
+          return res.status(200).end();
+        }
+
+        const range = parseByteRange(req.headers.range, meta.size);
+
+        if (range === 'unsatisfiable') {
+          res.setHeader('Content-Range', `bytes */${meta.size}`);
+          return res.status(416).end();
+        }
+
+        let start, end, statusCode;
+        if (range) {
+          ({ start, end } = range);
+          statusCode = 206;
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${meta.size}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+        } else {
+          start = 0;
+          end = meta.size - 1;
+          statusCode = 200;
+          res.setHeader('Content-Length', String(meta.size));
+        }
+
+        res.status(statusCode);
+        const stream = fs.createReadStream(meta.filePath, { start, end });
+        stream.on('error', (streamErr) => {
+          if (!res.headersSent) {
+            sendApiError(res, 500, 'STREAM_ERROR', String(streamErr));
+          } else {
+            res.destroy(streamErr);
+          }
+        });
+        stream.pipe(res);
+        return;
+      }
+
+      // Non-media files: read into buffer (existing behaviour).
+      const file = await readProjectFile(PROJECTS_DIR, req.params.id, relPath, project?.metadata);
       res.type(file.mime).send(file.buffer);
     } catch (err) {
       const status = err && err.code === 'ENOENT' ? 404 : 400;
