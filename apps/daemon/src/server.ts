@@ -134,10 +134,12 @@ import {
   isSafeId,
   listFiles,
   mimeFor,
+  parseByteRange,
   projectDir,
   readProjectFile,
   renameProjectFile,
   removeProjectDir,
+  resolveProjectFilePath,
   sanitizeName,
   searchProjectFiles,
   writeProjectFile,
@@ -4521,6 +4523,63 @@ export async function startServer({
   app.get('/api/projects/:id/files/*', async (req, res) => {
     try {
       const project = getProject(db, req.params.id);
+
+      // Resolve path + stat without reading content so we can decide whether
+      // to stream (media) or buffer (everything else).
+      const meta = await resolveProjectFilePath(
+        PROJECTS_DIR,
+        req.params.id,
+        req.params[0],
+        project?.metadata,
+      );
+
+      // Stream video and audio with HTTP 206 Partial Content support (RFC 7233).
+      // Browsers require range responses to seek/scrub media; buffering the
+      // whole file into memory would also block the process on large videos.
+      if (meta.mime.startsWith('video/') || meta.mime.startsWith('audio/')) {
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', meta.mime);
+
+        // Empty file edge case: nothing to range over.
+        if (meta.size === 0) {
+          res.setHeader('Content-Length', '0');
+          return res.status(200).end();
+        }
+
+        const range = parseByteRange(req.headers.range, meta.size);
+
+        if (range === 'unsatisfiable') {
+          res.setHeader('Content-Range', `bytes */${meta.size}`);
+          return res.status(416).end();
+        }
+
+        let start, end, statusCode;
+        if (range) {
+          ({ start, end } = range);
+          statusCode = 206;
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${meta.size}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+        } else {
+          start = 0;
+          end = meta.size - 1;
+          statusCode = 200;
+          res.setHeader('Content-Length', String(meta.size));
+        }
+
+        res.status(statusCode);
+        const stream = fs.createReadStream(meta.filePath, { start, end });
+        stream.on('error', (streamErr) => {
+          if (!res.headersSent) {
+            sendApiError(res, 500, 'STREAM_ERROR', String(streamErr));
+          } else {
+            res.destroy(streamErr);
+          }
+        });
+        stream.pipe(res);
+        return;
+      }
+
+      // Non-media files: read into buffer (existing behaviour).
       const file = await readProjectFile(
         PROJECTS_DIR,
         req.params.id,
