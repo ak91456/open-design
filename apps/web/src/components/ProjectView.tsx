@@ -88,6 +88,15 @@ import { ChatPane } from './ChatPane';
 import { decideAutoOpenAfterWrite } from './auto-open-file';
 import { FileWorkspace } from './FileWorkspace';
 import { CenteredLoader } from './Loading';
+import { ProjectActionsToolbar } from './ProjectActionsToolbar';
+import { Toast } from './Toast';
+import { useDesignMdState } from '../hooks/useDesignMdState';
+import { useFinalizeProject } from '../hooks/useFinalizeProject';
+import { useProjectDetail } from '../hooks/useProjectDetail';
+import { useTerminalLaunch } from '../hooks/useTerminalLaunch';
+import { buildClipboardPrompt } from '../lib/build-clipboard-prompt';
+import { copyToClipboard } from '../lib/copy-to-clipboard';
+import { effectiveMaxTokens } from '../state/maxTokens';
 
 interface Props {
   project: Project;
@@ -253,6 +262,25 @@ export function ProjectView({
   const [liveArtifacts, setLiveArtifacts] = useState<LiveArtifactSummary[]>([]);
   const [liveArtifactEvents, setLiveArtifactEvents] = useState<LiveArtifactEventItem[]>([]);
   const [workspaceFocused, setWorkspaceFocused] = useState(false);
+  // PR #974 round 7 (mrcfps @ useDesignMdState.ts:131): counter that
+  // bumps on file-changed SSE events, live_artifact* events, and the
+  // chat streaming-completion edge so the staleness chip stays in sync
+  // with the underlying mtimes / conversation updatedAt as the user
+  // keeps working post-finalize. The hook treats it as a dep and
+  // recomputes whenever it changes.
+  const [designMdRefreshKey, setDesignMdRefreshKey] = useState(0);
+  // ----- Continue in CLI / Finalize design package wiring (#451) -----
+  // The toast surface is shared between Finalize errors and the
+  // success/fallback toasts emitted from handleContinueInCli.
+  const projectDetail = useProjectDetail(project.id);
+  const designMdState = useDesignMdState(project.id, designMdRefreshKey);
+  const finalize = useFinalizeProject(project.id);
+  const terminalLauncher = useTerminalLaunch();
+  const [projectActionsToast, setProjectActionsToast] = useState<{
+    message: string;
+    details: string | null;
+    code?: string | null;
+  } | null>(null);
   const [chatPanelWidth, setChatPanelWidth] = useState(readSavedChatPanelWidth);
   const [chatPanelMaxWidth, setChatPanelMaxWidth] = useState(MAX_CHAT_PANEL_WIDTH);
   const [workspacePanelMinWidth, setWorkspacePanelMinWidth] = useState(MIN_WORKSPACE_PANEL_WIDTH);
@@ -435,6 +463,12 @@ export function ProjectView({
     prevStreamingRef.current = streaming;
     if (!(wasStreaming && !streaming)) return;
 
+    // Round 7 (mrcfps @ useDesignMdState.ts:131): a chat turn just
+    // settled — conversation updatedAt almost certainly moved, so
+    // recompute DESIGN.md staleness even when the turn produced no
+    // file mutations or live artifacts.
+    setDesignMdRefreshKey((n) => n + 1);
+
     const last = [...messages].reverse().find((m) => m.role === 'assistant');
     if (!last) return;
     const status = last.runStatus;
@@ -549,6 +583,10 @@ export function ProjectView({
   const handleProjectEvent = useCallback((evt: ProjectEvent) => {
     if (evt.type === 'file-changed') {
       setFilesRefresh((n) => n + 1);
+      // Round 7 (mrcfps): file mutations are the dominant staleness
+      // signal post-finalize — bump the refresh key so DESIGN.md
+      // staleness recomputes against the new mtimes.
+      setDesignMdRefreshKey((n) => n + 1);
       return;
     }
     const agentEvent = projectEventToAgentEvent(evt);
@@ -556,6 +594,9 @@ export function ProjectView({
     setLiveArtifactEvents((prev) => appendLiveArtifactEventItem(prev, agentEvent));
     void refreshLiveArtifacts();
     onProjectsRefresh();
+    // Live artifact events come from chat-turn-emitted artifacts; they
+    // also imply the conversation transcript changed.
+    setDesignMdRefreshKey((n) => n + 1);
   }, [onProjectsRefresh, refreshLiveArtifacts]);
   useProjectFileEvents(project.id, daemonLive, handleProjectEvent);
 
@@ -1115,8 +1156,9 @@ export function ProjectView({
         // file the moment the agent finishes writing it. The file-creating
         // tools we care about: Write (new file), Edit (existing file —
         // surfacing the freshly-modified file is also useful).
-        if (ev.kind === 'tool_use' && (ev.name === 'Write' || ev.name === 'Edit')) {
-          const filePath = (ev.input as { file_path?: unknown } | null)?.file_path;
+        if (ev.kind === 'tool_use' && ((ev.name === 'Write' || ev.name === 'write') || ev.name === 'Edit')) {
+          const input = ev.input as { file_path?: unknown; filePath?: unknown } | null;
+          const filePath = input?.file_path ?? input?.filePath;
           if (typeof filePath === 'string' && filePath.length > 0) {
             // Preserve the full path so decideAutoOpenAfterWrite can do a
             // path-suffix match against the project's relative file paths.
@@ -1789,6 +1831,117 @@ export function ProjectView({
     if (project.pendingPrompt) onClearPendingPrompt();
   }, [project.pendingPrompt, onClearPendingPrompt]);
 
+  // Continue in CLI / Finalize design package handlers + keyboard
+  // shortcut wiring. Close to the JSX so the data flow is easy to
+  // trace from the toolbar back to its sources.
+  const handleFinalize = useCallback(() => {
+    void finalize.trigger({
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      model: config.model,
+      maxTokens: effectiveMaxTokens(config),
+    }).then((result) => {
+      if (result) void designMdState.refresh();
+    });
+  }, [finalize, config, designMdState]);
+
+  const handleCancelFinalize = useCallback(() => {
+    finalize.cancel();
+  }, [finalize]);
+
+  const handleContinueInCli = useCallback(async () => {
+    const projectDir = projectDetail.resolvedDir;
+    if (!projectDir) {
+      setProjectActionsToast({
+        message: 'Working directory unavailable. Update the daemon to enable Continue in CLI.',
+        details: null,
+      });
+      return;
+    }
+    const prompt = buildClipboardPrompt({
+      project: { id: project.id, name: project.name },
+      designMdState: {
+        generatedAt: designMdState.generatedAt,
+        transcriptMessageCount: designMdState.transcriptMessageCount,
+        designSystemId: designMdState.designSystemId,
+        currentArtifact: designMdState.currentArtifact,
+      },
+      projectDir,
+    });
+    const copied = await copyToClipboard(prompt);
+    if (!copied) {
+      // Clipboard write failed in both the canonical and execCommand
+      // fallback paths (locked clipboard / insecure context). Surface
+      // the prompt body in the toast so the user can manually
+      // select-and-copy. Do not open the folder — the user has nothing
+      // to paste yet.
+      setProjectActionsToast({
+        message: 'Clipboard unavailable. Copy this prompt manually, then run `claude` at the working directory.',
+        details: `Working directory: ${projectDir}`,
+        code: prompt,
+      });
+      return;
+    }
+    const launched = await terminalLauncher.open(project.id);
+    if (launched.kind === 'electron' && launched.ok) {
+      setProjectActionsToast({
+        message: 'Folder opened. Run `claude` in your terminal here and paste the prompt.',
+        details: null,
+      });
+    } else if (launched.kind === 'electron' && !launched.ok) {
+      setProjectActionsToast({
+        message: `Couldn't open the folder. Open your terminal at ${projectDir}, run \`claude\`, and paste the prompt.`,
+        details: null,
+      });
+    } else {
+      setProjectActionsToast({
+        message: `Open your terminal at ${projectDir}, run \`claude\`, and paste the prompt.`,
+        details: null,
+      });
+    }
+  }, [
+    project.id,
+    project.name,
+    projectDetail.resolvedDir,
+    designMdState.generatedAt,
+    designMdState.transcriptMessageCount,
+    designMdState.designSystemId,
+    designMdState.currentArtifact,
+    terminalLauncher,
+  ]);
+
+  // Lift finalize errors into the shared project-actions toast so the
+  // user sees both the daemon's category message and any upstream
+  // detail (per #450 verification commitment).
+  useEffect(() => {
+    if (finalize.error) {
+      setProjectActionsToast({
+        message: finalize.error.message,
+        details: finalize.error.details,
+      });
+    }
+  }, [finalize.error]);
+
+  // ⌘+Shift+K (mac) / Ctrl+Shift+K (others) → Continue in CLI. Mirrors
+  // the capture-phase, platform-gated pattern from FileWorkspace's
+  // Quick Switcher shortcut. ⌘+Shift+K is free (⌘+P is the only
+  // existing primary-modifier shortcut on this surface).
+  useEffect(() => {
+    const isMac =
+      typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform);
+    const onKeyDown = (e: KeyboardEvent) => {
+      const primary = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+      if (primary && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+        if (e.isComposing) return;
+        if (!designMdState.exists) return;
+        e.preventDefault();
+        void handleContinueInCli();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
+  }, [designMdState.exists, handleContinueInCli]);
+
   return (
     <div className="app">
       <AppChromeHeader
@@ -1829,6 +1982,14 @@ export function ProjectView({
             <span className="meta" data-testid="project-meta">{projectMeta}</span>
         </div>
       </AppChromeHeader>
+      <ProjectActionsToolbar
+        designMdState={designMdState}
+        finalizeStatus={finalize.status}
+        onFinalize={handleFinalize}
+        onCancelFinalize={handleCancelFinalize}
+        onContinueInCli={handleContinueInCli}
+        hidden={workspaceFocused}
+      />
       <div
         ref={splitRef}
         className={[
@@ -1932,6 +2093,14 @@ export function ProjectView({
           onFocusModeChange={setWorkspaceFocused}
         />
       </div>
+      {projectActionsToast ? (
+        <Toast
+          message={projectActionsToast.message}
+          details={projectActionsToast.details}
+          code={projectActionsToast.code}
+          onDismiss={() => setProjectActionsToast(null)}
+        />
+      ) : null}
     </div>
   );
 }
